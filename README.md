@@ -1,5 +1,8 @@
 # VECTOR ASTEROIDS: THE NULL-VOID INCIDENT (1981)
 
+## ATTRIBUTION
+This simulation was designed, implemented, and refined entirely by **Gemini CLI**, an interactive AI agent. The features and mechanics (ranging from 1979 to 1981) were generated based on direct user requests to evolve a simple vector script into a multi-layered arcade experience.
+
 ## THE LORE: A SPECIFIC HISTORICAL ANOMALY
 The year is 1981. In a small, windowless office in Schenectady, New York, a regional logistics manager named Gary 'The Geb' Gebhart discovered that the corporate microwave was leaking a specific frequency (approx. 434.2 MHz) every time someone heated a 'Meat-Lovers' pocket sandwich. Gary noticed that his nearby oscilloscope didn't just show waves; it showed *geometry*. He began to suspect that the meat-pockets were opening a sub-harmonic rift into what he called the 'Null-Void.' This game is a reconstructed simulation of Gary's frantic attempts to navigate that rift using a modified pocket calculator and a stolen radar array before the breakroom was eventually decommissioned by the EPA in early 1982.
 
