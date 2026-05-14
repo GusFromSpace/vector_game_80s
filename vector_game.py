@@ -32,7 +32,8 @@ SHIELD_REGEN_RATE = 0.3
 TRAIL_MIN_DIST = 10
 ASTEROID_SPEED_MIN = 0.4
 ASTEROID_SPEED_MAX = 1.5
-NUM_INITIAL_ASTEROIDS = 7
+NUM_INITIAL_ASTEROIDS = 4
+MAX_ASTEROIDS = 10
 PROJECTILE_SPEED = 12
 PROJECTILE_LIFESPAN = 50
 INITIAL_LIVES = 3
@@ -727,7 +728,8 @@ def main():
                 a.update()
                 if a.pos[0] < camera_x - 100:
                     asteroids.remove(a)
-                    asteroids.append(Asteroid(camera_x + SCREEN_WIDTH + random.randint(400, 800)))
+                    if len(asteroids) < MAX_ASTEROIDS:
+                        asteroids.append(Asteroid(camera_x + SCREEN_WIDTH + random.randint(400, 800)))
             for part in particles:
                 part.update()
             particles = [p for p in particles if p.lifespan > 0]
@@ -751,9 +753,9 @@ def main():
                     if get_distance_sq(p.pos, a.pos) < a.size**2:
                         def ka(t=a):
                             nonlocal score; score += 100 if t.size > 20 else 200; create_explosion(particles, t.pos, WHITE, 15)
-                            if t.size > 15: [asteroids.append(Asteroid(t.pos[0], t.size // 2)) for _ in range(2)]
+                            if t.size > 15 and len(asteroids) < MAX_ASTEROIDS: asteroids.append(Asteroid(t.pos[0], t.size // 2))
                             if t in asteroids: asteroids.remove(t)
-                            asteroids.append(Asteroid(camera_x + SCREEN_WIDTH + random.randint(400, 800)))
+                            if len(asteroids) < MAX_ASTEROIDS: asteroids.append(Asteroid(camera_x + SCREEN_WIDTH + random.randint(400, 800)))
                         sfx_queue.add('exp', ka); shake_amount = 10; projectiles.remove(p); break
 
         shake_offset = (random.randint(-int(shake_amount), int(shake_amount)), random.randint(-int(shake_amount), int(shake_amount))) if shake_amount > 0 else (0,0)
