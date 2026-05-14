@@ -3,6 +3,8 @@ import math
 import random
 import array
 import numpy as np
+import json
+import os
 
 # Constants
 SCREEN_WIDTH = 800
@@ -48,6 +50,15 @@ BOSS_SCORE_MILESTONE = 20000
 BOSS_SCORE_CENTIPEDE = 40000
 SALVAGE_POD_LIFESPAN = 480 # 8 seconds
 
+# CRT / Visual Effect Defaults
+CRT_SCANLINE_ALPHA = 22
+CRT_SCANLINE_SPACING = 3
+CRT_VIGNETTE_STRENGTH = 90
+CRT_CHROMA_OFFSET = 2
+CRT_BLOOM_THRESHOLD = 180
+CRT_BLOOM_INTENSITY = 0.35
+PHOSPHOR_DECAY_ALPHA = 30  # Lower = longer trails (alpha subtracted per frame)
+
 # 1985 Power-Up Options
 POWERUP_LABELS = ["SPEED UP", "DOUBLE", "OPTION", "SHIELD"]
 
@@ -72,6 +83,101 @@ def get_distance_sq(p1, p2):
 
 def get_distance(p1, p2):
     return math.sqrt(get_distance_sq(p1, p2))
+
+class CRTPostProcessor:
+    """Retro-futuristic CRT post-processing pipeline.
+    Applies scanlines, vignette, chromatic aberration, and bloom."""
+    def __init__(self, width, height):
+        self.w, self.h = width, height
+        self.enabled = True
+        self._build_scanline_surface()
+        self._build_vignette_surface()
+
+    def _build_scanline_surface(self):
+        self.scanline_surf = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+        for y in range(0, self.h, CRT_SCANLINE_SPACING):
+            pygame.draw.line(self.scanline_surf, (0, 0, 0, CRT_SCANLINE_ALPHA), (0, y), (self.w, y), 1)
+
+    def _build_vignette_surface(self):
+        self.vignette_surf = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+        cx, cy = self.w // 2, self.h // 2
+        max_r = math.sqrt(cx * cx + cy * cy)
+        # Build vignette in rings from outside in
+        for r in range(int(max_r), 0, -4):
+            alpha = int((1.0 - (r / max_r) ** 1.5) * CRT_VIGNETTE_STRENGTH)
+            alpha = max(0, min(255, alpha))
+            if alpha > 0:
+                pygame.draw.circle(self.vignette_surf, (0, 0, 0, alpha), (cx, cy), r)
+
+    def apply(self, screen):
+        if not self.enabled:
+            return
+        # Chromatic aberration: offset red channel left, blue channel right
+        offset = CRT_CHROMA_OFFSET
+        if offset > 0:
+            # Extract and offset channels
+            px_arr = pygame.surfarray.pixels3d(screen)
+            # Shift red channel left (negative x)
+            red_shifted = np.roll(px_arr[:, :, 0], -offset, axis=0)
+            # Shift blue channel right (positive x)
+            blue_shifted = np.roll(px_arr[:, :, 2], offset, axis=0)
+            px_arr[:, :, 0] = red_shifted
+            px_arr[:, :, 2] = blue_shifted
+            del px_arr  # Release surface lock
+
+        # Bloom: extract bright pixels, blur, overlay
+        self._apply_bloom(screen)
+
+        # Scanlines overlay
+        screen.blit(self.scanline_surf, (0, 0))
+
+        # Vignette overlay
+        screen.blit(self.vignette_surf, (0, 0))
+
+    def _apply_bloom(self, screen):
+        # Downscale for cheap blur
+        small_w, small_h = self.w // 4, self.h // 4
+        small = pygame.transform.smoothscale(screen, (small_w, small_h))
+        # Threshold: darken non-bright pixels
+        px = pygame.surfarray.pixels3d(small)
+        brightness = px.max(axis=2)
+        mask = brightness < CRT_BLOOM_THRESHOLD
+        px[mask] = 0
+        del px
+        # Scale back up (creates natural blur)
+        bloom = pygame.transform.smoothscale(small, (self.w, self.h))
+        bloom.set_alpha(int(CRT_BLOOM_INTENSITY * 255))
+        screen.blit(bloom, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+
+class PhosphorTrail:
+    """Persistent phosphor decay surface — objects leave fading afterimages like a CRT."""
+    def __init__(self, width, height):
+        self.w, self.h = width, height
+        # RGB surface (no alpha needed for the trail itself)
+        self.trail_surf = pygame.Surface((width, height))
+        self.trail_surf.fill(BLACK)
+        # Decay multiplier surface — dims the trail each frame
+        self.decay_surf = pygame.Surface((width, height))
+        decay_val = 255 - PHOSPHOR_DECAY_ALPHA  # e.g., 225 means each pixel retains ~88% brightness
+        self.decay_surf.fill((decay_val, decay_val, decay_val))
+        self.enabled = True
+
+    def capture(self, source_screen):
+        """Imprint the current frame onto the trail (bright pixels dominate)."""
+        if not self.enabled:
+            return
+        # Decay existing trail first (multiplicative darkening toward black)
+        self.trail_surf.blit(self.decay_surf, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
+        # Stamp the new frame — brighter pixels overwrite dimmer trail pixels
+        self.trail_surf.blit(source_screen, (0, 0), special_flags=pygame.BLEND_RGB_MAX)
+
+    def apply(self, screen):
+        """Overlay the phosphor trail at reduced opacity."""
+        if not self.enabled:
+            return
+        self.trail_surf.set_alpha(60)  # Subtle ghost overlay
+        screen.blit(self.trail_surf, (0, 0))
 
 class BGMGenerator:
     def __init__(self):
@@ -102,36 +208,138 @@ class BGMGenerator:
         env = np.exp(-6.0 * np.linspace(0, 1, num_samples))
         return (noise * env * volume * 32767).astype(np.int16)
 
+    def _generate_808(self, freq, duration_samples, volume=0.8, slide_to=None):
+        """808-style sub bass: sine wave with pitch slide and long sustain."""
+        t = np.linspace(0, duration_samples / self.sample_rate, int(duration_samples), False)
+        if slide_to:
+            # Quick exponential pitch slide (like a real 808)
+            slide_curve = np.exp(-8.0 * np.linspace(0, 1, len(t)))
+            freqs = slide_to + (freq - slide_to) * slide_curve
+        else:
+            freqs = freq
+        # Pure sine for sub, slight saturation for presence
+        wave = np.sin(2 * np.pi * freqs * t)
+        wave = np.tanh(wave * 1.5)  # Soft clipping for warmth
+        # Long sustain envelope with gentle decay
+        env = np.exp(-0.8 * np.linspace(0, 1, len(t)))
+        return (np.clip(wave, -1, 1) * env * volume * 32767).astype(np.int16)
+
+    def _generate_pad(self, freq, duration_samples, volume=0.15):
+        """Dark atmospheric pad: layered detuned sines with slow attack."""
+        t = np.linspace(0, duration_samples / self.sample_rate, int(duration_samples), False)
+        # Layer multiple slightly detuned oscillators for width
+        wave = np.sin(2 * np.pi * freq * t)
+        wave += 0.7 * np.sin(2 * np.pi * (freq * 1.003) * t)  # Slight detune
+        wave += 0.7 * np.sin(2 * np.pi * (freq * 0.997) * t)  # Other direction
+        wave += 0.4 * np.sin(2 * np.pi * (freq * 2.01) * t)   # Octave harmonic
+        # Slow attack, long sustain, gentle release
+        attack = np.minimum(np.linspace(0, 1, len(t) // 4), 1.0)
+        attack = np.pad(attack, (0, len(t) - len(attack)), constant_values=1.0)
+        release = np.exp(-0.3 * np.linspace(0, 1, len(t)))
+        env = attack * release
+        return (np.clip(wave / 3, -1, 1) * env * volume * 32767).astype(np.int16)
+
     def generate_bgm(self, tension=0.0):
-        master_buffer = np.zeros(self.total_samples, dtype=np.int16)
+        # 8-bar loop, 140 BPM (UK drill / type beat range)
+        bar_count = 8
+        total = int((60 / self.bpm) * bar_count * 4 * self.sample_rate)
+        master_buffer = np.zeros(total, dtype=np.float64)
         beat_s = 60 / self.bpm
         beat_samples = int(beat_s * self.sample_rate)
 
-        for bar in range(4):
+        # --- Minor key base frequencies (generative: slight randomization each regen) ---
+        root = 32 + tension * 8  # Deep sub root
+        minor_third = root * 1.2
+        fifth = root * 1.5
+        minor_seventh = root * 1.8
+        bass_pattern = [root, root, minor_third, fifth, root, minor_seventh, root, fifth]
+
+        # --- 808 Bass (sliding, long sustain) ---
+        for bar in range(bar_count):
             base_idx = int((bar * 4 * beat_s) * self.sample_rate)
-            base_freq = 35 + tension * 15
+            bass_freq = bass_pattern[bar % len(bass_pattern)]
 
-            # Bass
-            if bar % 2 == 0:
-                tone = self._generate_tone(base_freq, beat_samples * 3, volume=0.8, slide_to=22)
-                master_buffer[base_idx:base_idx+len(tone)] += tone
-            else:
-                tone1 = self._generate_tone(base_freq + 3, beat_samples * 1.5, volume=0.8, slide_to=25)
-                master_buffer[base_idx:base_idx+len(tone1)] += tone1
-                tone2 = self._generate_tone(base_freq - 3, beat_samples, volume=0.8, slide_to=20)
-                start2 = int(base_idx + 2 * beat_samples)
-                master_buffer[start2:start2+len(tone2)] += tone2
+            # Main 808 hit on beat 1
+            slide_target = bass_freq * random.uniform(0.4, 0.6)
+            bass = self._generate_808(bass_freq, beat_samples * 3.5, volume=0.7 + tension * 0.15, slide_to=slide_target)
+            master_buffer[base_idx:base_idx+len(bass)] += bass
 
-            # Percussion
-            noise_idx = int(base_idx + 2 * beat_samples)
-            noise = self._generate_noise(5000 + tension * 10000, volume=0.4 + tension * 0.3)
-            master_buffer[noise_idx:noise_idx+len(noise)] += noise
+            # Occasional short 808 bounce on beat 3 (generative)
+            if random.random() < 0.4 + tension * 0.3:
+                bounce_idx = int(base_idx + 2 * beat_samples)
+                bounce_freq = bass_freq * random.choice([1.0, 1.5, 0.75])
+                bounce = self._generate_808(bounce_freq, beat_samples * 1.2, volume=0.45, slide_to=bounce_freq * 0.5)
+                master_buffer[bounce_idx:bounce_idx+len(bounce)] += bounce
 
-            for h_idx in range(4):
-                h_start = int(base_idx + h_idx * beat_samples)
-                hihat = self._generate_noise(1200, volume=0.1 + tension * 0.2)
-                master_buffer[h_start:h_start+len(hihat)] += hihat
+        # --- Trap hi-hat pattern (with rolls and ghost notes) ---
+        sixteenth = beat_samples // 4
+        for bar in range(bar_count):
+            base_idx = int((bar * 4 * beat_s) * self.sample_rate)
+            for step in range(16):  # 16 sixteenth notes per bar
+                h_start = int(base_idx + step * sixteenth)
 
+                # Base pattern: hits on every other sixteenth with some variation
+                if step % 2 == 0:
+                    vel = random.uniform(0.06, 0.14) + tension * 0.08
+                    hat_len = random.randint(800, 1400)
+                    hihat = self._generate_noise(hat_len, volume=vel)
+                    master_buffer[h_start:h_start+len(hihat)] += hihat
+                # Ghost notes (quiet, random)
+                elif random.random() < 0.3 + tension * 0.2:
+                    vel = random.uniform(0.02, 0.06)
+                    hihat = self._generate_noise(600, volume=vel)
+                    master_buffer[h_start:h_start+len(hihat)] += hihat
+
+                # Hi-hat rolls (32nd note bursts — signature UK drill pattern)
+                if step in (6, 7, 14, 15) and random.random() < 0.5 + tension * 0.3:
+                    thirty_second = sixteenth // 2
+                    for r in range(2):
+                        roll_start = h_start + r * thirty_second
+                        roll_vel = random.uniform(0.04, 0.1) * (1.0 + r * 0.3)
+                        roll = self._generate_noise(500, volume=roll_vel)
+                        if roll_start + len(roll) < total:
+                            master_buffer[roll_start:roll_start+len(roll)] += roll
+
+        # --- Snare / clap on beats 2 and 4 ---
+        for bar in range(bar_count):
+            base_idx = int((bar * 4 * beat_s) * self.sample_rate)
+            for beat in [1, 3]:  # Beats 2 and 4 (0-indexed)
+                snare_idx = int(base_idx + beat * beat_samples)
+                # Layered snare: noise burst + pitched transient
+                snare_body = self._generate_noise(4000 + int(tension * 3000), volume=0.25 + tension * 0.15)
+                snare_click = self._generate_tone(200, 1500, volume=0.15, slide_to=80, richness=0.2)
+                master_buffer[snare_idx:snare_idx+len(snare_body)] += snare_body
+                master_buffer[snare_idx:snare_idx+len(snare_click)] += snare_click
+
+        # --- Dark atmospheric pad (replaces arpeggiator) ---
+        pad_notes = [root * 4, minor_third * 4, fifth * 2, minor_seventh * 2]
+        pad_duration = beat_samples * 8  # 2 bars per pad
+        pad_volume = 0.08 + tension * 0.06
+        for i, note in enumerate(pad_notes):
+            pad_start = int(i * 2 * 4 * beat_s * self.sample_rate)
+            if pad_start + pad_duration > total:
+                pad_duration = total - pad_start
+            if pad_duration > 0:
+                pad = self._generate_pad(note, pad_duration, volume=pad_volume)
+                master_buffer[pad_start:pad_start+len(pad)] += pad
+
+        # --- Sparse melodic stabs (generative — different each time) ---
+        if tension > 0.2:
+            pentatonic = [root * 8, minor_third * 8, fifth * 4, minor_seventh * 4, root * 16]
+            stab_volume = 0.06 + (tension - 0.2) * 0.12
+            num_stabs = random.randint(3, 7)
+            for _ in range(num_stabs):
+                stab_bar = random.randint(0, bar_count - 1)
+                stab_beat = random.choice([0, 0.5, 1, 2, 2.5, 3])
+                stab_start = int((stab_bar * 4 + stab_beat) * beat_s * self.sample_rate)
+                stab_freq = random.choice(pentatonic)
+                stab = self._generate_tone(stab_freq, beat_samples * random.uniform(0.3, 0.8),
+                                          volume=stab_volume, richness=0.15)
+                if stab_start + len(stab) < total:
+                    master_buffer[stab_start:stab_start+len(stab)] += stab
+
+        # Clip and convert to int16
+        master_buffer = np.clip(master_buffer, -32767, 32767).astype(np.int16)
         return pygame.mixer.Sound(buffer=master_buffer)
 
     def generate_sfx(self):
@@ -142,11 +350,30 @@ class BGMGenerator:
             self._generate_tone(1200, 4000, volume=0.4, slide_to=800),
             self._generate_tone(1000, 4000, volume=0.4, slide_to=600)
         ])
+        # New SFX
+        graze = self._generate_tone(1500, 2000, volume=0.15, slide_to=2000, richness=0.2)
+        claim = np.concatenate([
+            self._generate_tone(400, 3000, volume=0.3, slide_to=800),
+            self._generate_tone(800, 4000, volume=0.35, slide_to=1200)
+        ])
+        powerup = np.concatenate([
+            self._generate_tone(600, 2000, volume=0.25, slide_to=900),
+            self._generate_tone(900, 2000, volume=0.25, slide_to=1200),
+            self._generate_tone(1200, 3000, volume=0.3, slide_to=1600)
+        ])
+        boss_hit = np.concatenate([
+            self._generate_tone(60, 4000, volume=0.4, slide_to=30),
+            self._generate_noise(6000, volume=0.25)
+        ])
         return {
             'fire': pygame.mixer.Sound(buffer=fire),
             'exp': pygame.mixer.Sound(buffer=exp),
             'hit': pygame.mixer.Sound(buffer=hit),
-            'weapon': pygame.mixer.Sound(buffer=weapon)
+            'weapon': pygame.mixer.Sound(buffer=weapon),
+            'graze': pygame.mixer.Sound(buffer=graze),
+            'claim': pygame.mixer.Sound(buffer=claim),
+            'powerup': pygame.mixer.Sound(buffer=powerup),
+            'boss_hit': pygame.mixer.Sound(buffer=boss_hit)
         }
 
 class SalvagePod:
@@ -462,8 +689,60 @@ def draw_text(screen, text, size, x, y, color=WHITE, center=False, wrap_width=No
 def create_explosion(particles, pos, color, count=15):
     for _ in range(count): particles.append(Particle(pos, color, is_bloom=(random.random() > 0.5)))
 
-def get_state(player, asteroids, enemies, projectiles, cam_x):
-    """Returns normalized game state as a plain list of 61 floats."""
+class FloatingText:
+    """Score popup that drifts upward and fades out."""
+    def __init__(self, pos, text, color=WHITE, size=18):
+        self.pos = list(pos)
+        self.text, self.color, self.size = text, color, size
+        self.lifespan = 45
+        self.max_life = 45
+    def update(self):
+        self.pos[1] -= 1.2; self.lifespan -= 1
+    def draw(self, screen, camera_x, shake_offset=(0, 0)):
+        if self.lifespan > 0:
+            alpha_ratio = self.lifespan / self.max_life
+            # Fade the color toward black
+            c = tuple(int(ch * alpha_ratio) for ch in self.color)
+            cx = self.pos[0] - camera_x + shake_offset[0]
+            cy = self.pos[1] + shake_offset[1]
+            draw_text(screen, self.text, self.size, int(cx), int(cy), c, center=True)
+
+COMBO_WINDOW = 120  # frames (~2 seconds at 60fps)
+COMBO_TIERS = [1, 2, 4, 8, 16]  # multiplier tiers at 0, 1, 2, 3, 4+ kills in window
+
+class ComboTracker:
+    """Tracks chain kills and provides a score multiplier."""
+    def __init__(self):
+        self.chain = 0          # kills in current window
+        self.timer = 0          # frames since last kill
+        self.multiplier = 1
+        self.display_timer = 0  # for pulsing the multiplier display
+    def register_kill(self):
+        self.chain += 1; self.timer = COMBO_WINDOW; self.display_timer = 20
+        tier = min(self.chain, len(COMBO_TIERS) - 1)
+        self.multiplier = COMBO_TIERS[tier]
+    def reset(self):
+        """Call on player damage."""
+        self.chain, self.multiplier, self.timer = 0, 1, 0
+    def update(self):
+        if self.timer > 0:
+            self.timer -= 1
+            if self.timer == 0: self.chain, self.multiplier = 0, 1
+        if self.display_timer > 0: self.display_timer -= 1
+    def apply(self, base_score):
+        """Returns the multiplied score."""
+        return base_score * self.multiplier
+
+
+def get_state(player, asteroids, enemies, projectiles, cam_x,
+              combo=None, star_fragments=None, salvage_pods=None,
+              score=0, lives=3, scroll_speed=1.5, boss_active=False):
+    """Returns normalized telemetry readout as a list of 75 floats.
+
+    Channels 0-60: Legacy oscilloscope format (backward compatible).
+    Channels 61-74: Extended harmonic analysis data.
+    """
+    # --- Legacy channels (0-60) ---
     obs = [(player.pos[0]-cam_x)/800, player.pos[1]/600, player.velocity[0]/10, player.velocity[1]/10, player.angle/6.28, player.shield_energy/100, 0.0]
     sorted_asts = sorted(asteroids, key=lambda a: get_distance_sq(player.pos, a.pos))[:5]
     for a in sorted_asts:
@@ -484,24 +763,308 @@ def get_state(player, asteroids, enemies, projectiles, cam_x):
         angle = math.atan2(p.pos[1]-player.pos[1], p.pos[0]-player.pos[0]) / 3.14
         obs.extend([dist, angle, (p.velocity[0]-player.velocity[0])/15.0, (p.velocity[1]-player.velocity[1])/15.0])
     while len(obs) < 61: obs.extend([0])
+
+    # --- Extended harmonic channels (61-74) ---
+    combo_mult = combo.multiplier / 16.0 if combo else 0.0
+    combo_decay = combo.timer / 120.0 if combo else 0.0
+    dist_traveled = cam_x / 10000.0
+    boss_flag = 1.0 if boss_active else 0.0
+    claim_flag = 1.0 if player.claiming else 0.0
+    weapon_ch = (player.current_weapon + 1) / 4.0 if player.current_weapon is not None else 0.0
+    option_ch = len(player.options) / 2.0
+    lives_ch = lives / 3.0
+    scroll_ch = scroll_speed / 5.0
+    shield_flag = 1.0 if player.shield_active else 0.0
+
+    # Nearest star fragment (opportunity signal)
+    sf_dist, sf_angle = 0.0, 0.0
+    if star_fragments:
+        nearest_sf = min(star_fragments, key=lambda s: get_distance_sq(player.pos, s.pos))
+        sf_dist = min(get_distance(player.pos, nearest_sf.pos) / 800.0, 1.0)
+        sf_angle = math.atan2(nearest_sf.pos[1]-player.pos[1], nearest_sf.pos[0]-player.pos[0]) / 3.14
+
+    # Nearest salvage pod (recovery opportunity)
+    sp_dist, sp_angle = 0.0, 0.0
+    if salvage_pods:
+        nearest_sp = min(salvage_pods, key=lambda s: get_distance_sq(player.pos, s.pos))
+        sp_dist = min(get_distance(player.pos, nearest_sp.pos) / 800.0, 1.0)
+        sp_angle = math.atan2(nearest_sp.pos[1]-player.pos[1], nearest_sp.pos[0]-player.pos[0]) / 3.14
+
+    obs.extend([combo_mult, combo_decay, dist_traveled, boss_flag, claim_flag,
+                weapon_ch, option_ch, lives_ch, scroll_ch, shield_flag,
+                sf_dist, sf_angle, sp_dist, sp_angle])
+
     return obs
 
-# External controller slot. Set to an object with .step(state) -> list[float x5]
-# to enable autopilot mode. Optional: .telemetry property -> dict.
+# === OSCILLOSCOPE TAP INTERFACE ===
+# These module-level slots allow external signal processors to interface with
+# the simulation. Set them before calling main() to enable automated analysis.
+
+# External signal processor. Set to an object with .step(telemetry) -> list[float x5]
+# to enable automated navigation. Optional: .telemetry property -> dict.
 _AUTOPILOT_CONTROLLER = None
 
-# Session observer slot. Set to a callable(state, action, reward) to observe gameplay.
+# Session recorder. Set to a callable to capture simulation telemetry.
+# Signature: callable(telemetry, controls, signal_strength, terminated, session_data)
 _SESSION_OBSERVER = None
 
+# Simulation calibration parameters. Set to a dict to override defaults.
+# Recognized fields (all optional):
+#   rift_density       -> NUM_INITIAL_ASTEROIDS, MAX_ASTEROIDS
+#   echo_aggression    -> ENEMY_SPAWN_CHANCE, GLITCH_SEEKER_CHANCE
+#   void_velocity      -> BASE_SCROLL_SPEED, FORCED_SCROLL_INC
+#   harmonic_stability -> INITIAL_LIVES
+#   resonance_threshold -> BOSS_SCORE_MILESTONE, BOSS_SCORE_CENTIPEDE
+#   calibration_seed   -> RNG seed for deterministic sessions
+#   star_frequency     -> STAR_FRAGMENT_SPAWN_CHANCE
+_SIMULATION_CONFIG = None
+
+# Simulation rendering mode. Set to 'protocol' to run without display output.
+# Default None = normal rendered mode.
+_SIMULATION_MODE = None
+
+def _apply_calibration():
+    """Apply simulation calibration parameters to session constants."""
+    global NUM_INITIAL_ASTEROIDS, MAX_ASTEROIDS, ENEMY_SPAWN_CHANCE, GLITCH_SEEKER_CHANCE
+    global BASE_SCROLL_SPEED, FORCED_SCROLL_INC, INITIAL_LIVES
+    global BOSS_SCORE_MILESTONE, BOSS_SCORE_CENTIPEDE, STAR_FRAGMENT_SPAWN_CHANCE
+    if _SIMULATION_CONFIG is None:
+        return
+    cfg = _SIMULATION_CONFIG
+    if 'rift_density' in cfg:
+        NUM_INITIAL_ASTEROIDS = int(cfg['rift_density'] * 4)
+        MAX_ASTEROIDS = int(cfg['rift_density'] * 10)
+    if 'echo_aggression' in cfg:
+        ENEMY_SPAWN_CHANCE = 0.006 * cfg['echo_aggression']
+        GLITCH_SEEKER_CHANCE = 0.003 * cfg['echo_aggression']
+    if 'void_velocity' in cfg:
+        BASE_SCROLL_SPEED = 1.5 * cfg['void_velocity']
+        FORCED_SCROLL_INC = 0.0001 * cfg['void_velocity']
+    if 'harmonic_stability' in cfg:
+        INITIAL_LIVES = int(cfg['harmonic_stability'])
+    if 'resonance_threshold' in cfg:
+        rt = cfg['resonance_threshold']
+        BOSS_SCORE_MILESTONE = int(20000 * rt)
+        BOSS_SCORE_CENTIPEDE = int(40000 * rt)
+    if 'star_frequency' in cfg:
+        STAR_FRAGMENT_SPAWN_CHANCE = cfg['star_frequency']
+    if 'calibration_seed' in cfg:
+        seed = cfg['calibration_seed']
+        random.seed(seed)
+        np.random.seed(seed)
+
+
+HIGHSCORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "highscores.json")
+
+class HighScoreManager:
+    """Persists top 10 high scores with 3-character initials."""
+    def __init__(self):
+        self.scores = self._load()
+
+    def _load(self):
+        try:
+            with open(HIGHSCORE_FILE, 'r') as f:
+                data = json.load(f)
+                return data[:10]
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def _save(self):
+        with open(HIGHSCORE_FILE, 'w') as f:
+            json.dump(self.scores[:10], f, indent=2)
+
+    def qualifies(self, score):
+        return len(self.scores) < 10 or score > self.scores[-1]['score']
+
+    def add(self, name, score):
+        self.scores.append({'name': name[:3].upper(), 'score': score})
+        self.scores.sort(key=lambda x: x['score'], reverse=True)
+        self.scores = self.scores[:10]
+        self._save()
+
+
+def title_screen(screen, clock, crt, phosphor):
+    """Animated title screen with scrolling lore. Returns when player presses start."""
+    # Decorative background asteroids
+    bg_asteroids = []
+    for _ in range(12):
+        a = Asteroid(random.randint(0, SCREEN_WIDTH), random.randint(10, 35))
+        a.velocity = [random.uniform(-1, 1), random.uniform(-0.5, 0.5)]
+        bg_asteroids.append(a)
+
+    hsm = HighScoreManager()
+    timer = 0
+    lore_lines = [
+        "THE YEAR IS 1981.",
+        "IN SCHENECTADY, NEW YORK, A LOGISTICS MANAGER",
+        "NAMED GARY 'THE GEB' GEBHART DISCOVERED THAT",
+        "THE CORPORATE MICROWAVE WAS LEAKING A SPECIFIC",
+        "FREQUENCY EVERY TIME SOMEONE HEATED A",
+        "'MEAT-LOVERS' POCKET SANDWICH.",
+        "",
+        "THE OSCILLOSCOPE SHOWED GEOMETRY.",
+        "THE MEAT-POCKETS WERE OPENING A",
+        "SUB-HARMONIC RIFT INTO THE NULL-VOID.",
+    ]
+    lore_scroll_y = SCREEN_HEIGHT + 20
+
+    while True:
+        timer += 1
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: pygame.quit(); return False
+            if event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_KP_ENTER):
+                    return True
+                if event.key == pygame.K_F2:
+                    crt.enabled = not crt.enabled; phosphor.enabled = not phosphor.enabled
+                if event.key == pygame.K_F11:
+                    return True  # Just start the game on F11
+
+        # Update background
+        for a in bg_asteroids:
+            a.update()
+            a.pos[0] %= SCREEN_WIDTH
+            a.pos[1] %= SCREEN_HEIGHT
+        lore_scroll_y -= 0.4
+        if lore_scroll_y < -len(lore_lines) * 22:
+            lore_scroll_y = SCREEN_HEIGHT + 20
+
+        # Draw
+        screen.fill(BLACK)
+
+        # Lore crawl (dim, in the background)
+        for i, line in enumerate(lore_lines):
+            y = lore_scroll_y + i * 22
+            if 80 < y < SCREEN_HEIGHT - 80:
+                alpha = 1.0 - abs(y - SCREEN_HEIGHT // 2) / (SCREEN_HEIGHT // 2)
+                c = int(alpha * 80)
+                draw_text(screen, line, 14, SCREEN_WIDTH // 2, int(y), (c, c, c + 20), center=True)
+
+        # Asteroids
+        for a in bg_asteroids:
+            a.draw(screen, 0, (0, 0))
+
+        # Title — large pulsing text
+        title_pulse = 0.7 + 0.3 * abs(math.sin(timer * 0.02))
+        title_r = int(255 * title_pulse)
+        title_g = int(20 * title_pulse)
+        title_b = int(147 * title_pulse)
+        draw_text(screen, "VECTOR ASTEROIDS", 52, SCREEN_WIDTH // 2, 140, (title_r, title_g, title_b), center=True)
+
+        # Subtitle
+        sub_pulse = 0.5 + 0.5 * abs(math.sin(timer * 0.015 + 1))
+        draw_text(screen, "THE NULL-VOID INCIDENT", 22, SCREEN_WIDTH // 2, 190, (int(sub_pulse * 0), int(sub_pulse * 255), int(sub_pulse * 255)), center=True)
+
+        # Year badge
+        draw_text(screen, "[ 1981 ]", 16, SCREEN_WIDTH // 2, 220, (100, 100, 120), center=True)
+
+        # Start prompt (blinks)
+        if timer % 80 < 60:
+            draw_text(screen, "PRESS ENTER TO BEGIN", 20, SCREEN_WIDTH // 2, 320, YELLOW, center=True)
+
+        # Controls hint
+        draw_text(screen, "ARROWS: MOVE   SPACE: FIRE   SHIFT: CLAIM   DOWN: SHIELD", 12, SCREEN_WIDTH // 2, 380, (80, 80, 100), center=True)
+        draw_text(screen, "P: PAUSE   F2: CRT FX   F3: FPS   F11: FULLSCREEN", 12, SCREEN_WIDTH // 2, 400, (60, 60, 80), center=True)
+
+        # High scores
+        if hsm.scores:
+            draw_text(screen, "HIGH SCORES", 18, SCREEN_WIDTH // 2, 440, CYAN, center=True)
+            for i, entry in enumerate(hsm.scores[:5]):
+                rank_color = YELLOW if i == 0 else WHITE
+                draw_text(screen, f"{i+1}. {entry['name']}  {entry['score']:,}", 16, SCREEN_WIDTH // 2, 465 + i * 22, rank_color, center=True)
+
+        # Border
+        pygame.draw.rect(screen, NEON_BLUE, (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT), 4)
+
+        # Apply effects
+        phosphor.capture(screen)
+        phosphor.apply(screen)
+        crt.apply(screen)
+
+        pygame.display.flip()
+        clock.tick(FPS)
+
+    return True
+
+
+def score_entry_screen(screen, clock, crt, phosphor, final_score):
+    """3-character initial entry for high scores. Returns the initials string."""
+    chars = ['A', 'A', 'A']
+    cursor = 0
+    timer = 0
+
+    while True:
+        timer += 1
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: pygame.quit(); return None
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_UP:
+                    c = ord(chars[cursor])
+                    chars[cursor] = chr(c + 1) if c < ord('Z') else 'A'
+                elif event.key == pygame.K_DOWN:
+                    c = ord(chars[cursor])
+                    chars[cursor] = chr(c - 1) if c > ord('A') else 'Z'
+                elif event.key == pygame.K_RIGHT:
+                    cursor = min(2, cursor + 1)
+                elif event.key == pygame.K_LEFT:
+                    cursor = max(0, cursor - 1)
+                elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    return ''.join(chars)
+
+        screen.fill(BLACK)
+
+        draw_text(screen, "NEW HIGH SCORE!", 36, SCREEN_WIDTH // 2, 150, YELLOW, center=True)
+        draw_text(screen, f"{final_score:,}", 48, SCREEN_WIDTH // 2, 210, CYAN, center=True)
+        draw_text(screen, "ENTER YOUR INITIALS", 20, SCREEN_WIDTH // 2, 280, WHITE, center=True)
+
+        # Draw character slots
+        for i, ch in enumerate(chars):
+            x = SCREEN_WIDTH // 2 - 60 + i * 60
+            y = 340
+            color = YELLOW if i == cursor else WHITE
+            draw_text(screen, ch, 48, x, y, color, center=True)
+            if i == cursor and timer % 40 < 25:
+                pygame.draw.line(screen, color, (x - 15, y + 25), (x + 15, y + 25), 3)
+
+        draw_text(screen, "UP/DOWN: CHANGE   LEFT/RIGHT: MOVE   ENTER: CONFIRM", 12, SCREEN_WIDTH // 2, 420, (80, 80, 100), center=True)
+
+        pygame.draw.rect(screen, NEON_BLUE, (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT), 4)
+
+        phosphor.capture(screen)
+        phosphor.apply(screen)
+        crt.apply(screen)
+
+        pygame.display.flip()
+        clock.tick(FPS)
+
+
 def main():
+    _apply_calibration()
     pygame.init(); pygame.mixer.init(); bgm_gen = BGMGenerator(); bgm_sound = bgm_gen.generate_bgm(); sfx_queue = SFXQueue(bgm_gen.generate_sfx(), bgm_gen.ms_per_16th)
     bgm_sound.play(loops=-1); screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT)); pygame.display.set_caption("Vector Asteroids: Harmonic Void")
     clock, player = pygame.time.Clock(), Player(); asteroids = [Asteroid() for _ in range(NUM_INITIAL_ASTEROIDS)]
     projectiles, star_fragments, enemies, glitch_seekers, particles, pickups, salvage_pods = [], [], [], [], [], [], []
+    floating_texts = []
+    combo = ComboTracker()
     shake_amount, score, lives, game_over, camera_x = 0, 0, INITIAL_LIVES, False, 0
     current_scroll_speed, current_transmission, seen_milestones = BASE_SCROLL_SPEED, None, set()
     layers = [ParallaxLayer(0.2, (60, 60, 80), 40, is_lattice=True), ParallaxLayer(0.5, (100, 80, 150), 30), ParallaxLayer(0.8, (80, 150, 200), 20)]
     current_boss = None; centipede_boss = None
+
+    # Visual effect systems
+    crt = CRTPostProcessor(SCREEN_WIDTH, SCREEN_HEIGHT)
+    phosphor = PhosphorTrail(SCREEN_WIDTH, SCREEN_HEIGHT)
+    hsm = HighScoreManager()
+
+    # Show title screen on launch
+    if not title_screen(screen, clock, crt, phosphor):
+        return
+
+    # UI state
+    paused = False
+    show_fps = False
+    is_fullscreen = False
 
     autopilot = False
     autopilot_telemetry = {"probs": [0.0]*5, "risk": 0.0, "opp": 0.0, "var": 0.0}
@@ -514,18 +1077,45 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT: running = False
             if event.type == pygame.KEYDOWN:
+                # Pause toggle (works in any state except game over)
+                if event.key in (pygame.K_p, pygame.K_ESCAPE) and not game_over:
+                    paused = not paused; continue
+                # Fullscreen toggle
+                if event.key == pygame.K_F11:
+                    is_fullscreen = not is_fullscreen
+                    if is_fullscreen:
+                        screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.FULLSCREEN)
+                    else:
+                        screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+                    continue
+                # FPS counter toggle
+                if event.key == pygame.K_F3: show_fps = not show_fps; continue
+                # CRT effects toggle
+                if event.key == pygame.K_F2: crt.enabled = not crt.enabled; phosphor.enabled = not phosphor.enabled; continue
+                # Skip if paused
+                if paused: continue
                 if current_transmission: current_transmission = None; continue
                 if event.key == pygame.K_a: autopilot = not autopilot
                 if event.key == pygame.K_SPACE and not game_over:
                     for s in player.fire(): projectiles.append(s)
                 if event.key == pygame.K_c and not game_over: player.activate_powerup()
                 if event.key == pygame.K_r and game_over:
+                    # High score entry if qualified
+                    if hsm.qualifies(score):
+                        initials = score_entry_screen(screen, clock, crt, phosphor, score)
+                        if initials: hsm.add(initials, score)
+                    # Show title screen before restarting
+                    if not title_screen(screen, clock, crt, phosphor): running = False; continue
                     player.reset(); asteroids = [Asteroid() for _ in range(NUM_INITIAL_ASTEROIDS)]; projectiles, star_fragments, enemies, glitch_seekers, particles, pickups, salvage_pods = [], [], [], [], [], [], []
+                    floating_texts = []; combo = ComboTracker()
                     score, lives, game_over, camera_x, shake_amount, current_scroll_speed, seen_milestones = 0, INITIAL_LIVES, False, 0, 0, BASE_SCROLL_SPEED, set(); current_boss = None; centipede_boss = None
-                    last_score, last_lives = 0, INITIAL_LIVES
+                    last_score, last_lives = 0, INITIAL_LIVES; paused = False
 
-        if not game_over and not current_transmission:
-            state = get_state(player, asteroids, enemies, projectiles, camera_x)
+        if not game_over and not current_transmission and not paused:
+            state = get_state(player, asteroids, enemies, projectiles, camera_x,
+                              combo=combo, star_fragments=star_fragments, salvage_pods=salvage_pods,
+                              score=score, lives=lives, scroll_speed=current_scroll_speed,
+                              boss_active=(current_boss is not None or centipede_boss is not None))
             keys = pygame.key.get_pressed()
 
             if autopilot and _AUTOPILOT_CONTROLLER is not None:
@@ -568,9 +1158,21 @@ def main():
             last_score, last_lives = score, lives
 
             if _SESSION_OBSERVER is not None:
-                _SESSION_OBSERVER(state, action, reward)
+                session_data = {
+                    'score': score, 'lives': lives, 'distance': camera_x,
+                    'combo_chain': combo.chain, 'combo_multiplier': combo.multiplier,
+                    'boss_phase': 'resonance' if current_boss else 'centipede' if centipede_boss else 'drift',
+                    'entity_count': len(asteroids) + len(enemies) + len(glitch_seekers),
+                    'scroll_velocity': current_scroll_speed
+                }
+                _SESSION_OBSERVER(state, action, reward, game_over, session_data)
 
             current_scroll_speed += FORCED_SCROLL_INC; camera_x += current_scroll_speed; sfx_queue.update()
+            combo.update()
+            # Reset combo on damage (detected via lives change)
+            if lives < last_lives: combo.reset()
+            for ft in floating_texts[:]: ft.update()
+            floating_texts = [ft for ft in floating_texts if ft.lifespan > 0]
             if score >= BOSS_SCORE_MILESTONE and current_boss is None and score < BOSS_SCORE_CENTIPEDE: current_boss = Boss(camera_x + SCREEN_WIDTH + 200)
             if score >= BOSS_SCORE_CENTIPEDE and centipede_boss is None: centipede_boss = CentipedeBoss(camera_x + SCREEN_WIDTH + 200)
             if random.random() < WEAPON_SPAWN_CHANCE: pickups.append(WeaponPickup(camera_x + SCREEN_WIDTH + 100))
@@ -610,7 +1212,7 @@ def main():
             else:
                 if player.claiming and len(player.trail) > 5:
                     if get_distance_sq(player.pos, player.trail[0]) < 2500:
-                        score += 500; create_explosion(particles, player.pos, YELLOW, 20)
+                        score += 500; sfx_queue.add('claim'); create_explosion(particles, player.pos, YELLOW, 20)
                         t_min_x = t_max_x = player.trail[0][0]
                         t_min_y = t_max_y = player.trail[0][1]
                         for tx, ty in player.trail:
@@ -658,7 +1260,7 @@ def main():
                     if p in projectiles: projectiles.remove(p)
                 else:
                     if p.is_enemy and not p.grazed and not player.shield_active:
-                         if get_distance_sq(p.pos, player.pos) < 2500: score += 100; p.grazed = True
+                         if get_distance_sq(p.pos, player.pos) < 2500: score += 100; p.grazed = True; sfx_queue.add('graze')
                     if p.is_enemy and not player.shield_active and player.invulnerable_frames == 0:
                         if get_distance_sq(p.pos, player.pos) < p_size_sq:
                             sfx_queue.add('hit'); create_explosion(particles, player.pos, RED, 40); shake_amount, lives = 30, lives - 1
@@ -669,7 +1271,7 @@ def main():
                             if p in projectiles: projectiles.remove(p); continue
                     for g in glitch_seekers[:]:
                         if not p.is_enemy and get_distance_sq(p.pos, g.pos) < g.size**2:
-                            def kg(t=g): nonlocal score; score += 1500; create_explosion(particles, t.pos, GREEN, 20); [glitch_seekers.remove(t) if t in glitch_seekers else None]
+                            def kg(t=g): nonlocal score; combo.register_kill(); pts = combo.apply(1500); score += pts; floating_texts.append(FloatingText(t.pos, f"+{pts}", GREEN)); create_explosion(particles, t.pos, GREEN, 20); [glitch_seekers.remove(t) if t in glitch_seekers else None]
                             sfx_queue.add('exp', kg); projectiles.remove(p); break
                     if p not in projectiles: continue
                     if centipede_boss and not p.is_enemy:
@@ -687,13 +1289,13 @@ def main():
                         if hit_boss: continue
                         if all(sh['health'] <= 0 for sh in current_boss.shields):
                              if get_distance_sq(p.pos, current_boss.pos) < 1600:
-                                 current_boss.health -= 1; sfx_queue.add('hit'); projectiles.remove(p)
+                                 current_boss.health -= 1; sfx_queue.add('boss_hit'); projectiles.remove(p)
                                  if current_boss.health <= 0: score += 10000; create_explosion(particles, current_boss.pos, CYAN, 100); current_boss = None; shake_amount = 50
                                  continue
             for s in star_fragments[:]:
                 s.update()
                 if get_distance_sq(player.pos, s.pos) < (player.size + s.size)**2:
-                    score += 1000; create_explosion(particles, s.pos, PURPLE, 10); star_fragments.remove(s); player.powerup_index = (player.powerup_index + 1) % len(POWERUP_LABELS)
+                    score += 1000; sfx_queue.add('powerup'); create_explosion(particles, s.pos, PURPLE, 10); star_fragments.remove(s); player.powerup_index = (player.powerup_index + 1) % len(POWERUP_LABELS)
                 elif s.pos[1] > SCREEN_HEIGHT: star_fragments.remove(s)
                 elif player.claiming:
                     for i in range(len(player.trail)):
@@ -714,7 +1316,7 @@ def main():
                     if e not in enemies: continue
                     for p in projectiles[:]:
                         if not p.is_enemy and get_distance_sq(e.pos, p.pos) < e.size**2:
-                            def ke(t=e): nonlocal score; score += 500; create_explosion(particles, t.pos, WHITE, 25); [enemies.remove(t) if t in enemies else None]
+                            def ke(t=e): nonlocal score; combo.register_kill(); pts = combo.apply(500); score += pts; floating_texts.append(FloatingText(t.pos, f"+{pts}", CYAN)); create_explosion(particles, t.pos, WHITE, 25); [enemies.remove(t) if t in enemies else None]
                             sfx_queue.add('exp', ke); shake_amount = 15; projectiles.remove(p); break
                     if e not in enemies: continue
                     if not player.shield_active and player.invulnerable_frames == 0:
@@ -752,17 +1354,22 @@ def main():
                 for p in projectiles[:]:
                     if get_distance_sq(p.pos, a.pos) < a.size**2:
                         def ka(t=a):
-                            nonlocal score; score += 100 if t.size > 20 else 200; create_explosion(particles, t.pos, WHITE, 15)
+                            nonlocal score; combo.register_kill(); base = 100 if t.size > 20 else 200; pts = combo.apply(base); score += pts; floating_texts.append(FloatingText(t.pos, f"+{pts}", WHITE)); create_explosion(particles, t.pos, WHITE, 15)
                             if t.size > 15 and len(asteroids) < MAX_ASTEROIDS: asteroids.append(Asteroid(t.pos[0], t.size // 2))
                             if t in asteroids: asteroids.remove(t)
                             if len(asteroids) < MAX_ASTEROIDS: asteroids.append(Asteroid(camera_x + SCREEN_WIDTH + random.randint(400, 800)))
                         sfx_queue.add('exp', ka); shake_amount = 10; projectiles.remove(p); break
 
+        # === RENDERING PIPELINE ===
         shake_offset = (random.randint(-int(shake_amount), int(shake_amount)), random.randint(-int(shake_amount), int(shake_amount))) if shake_amount > 0 else (0,0)
         shake_amount *= 0.9; screen.fill(BLACK); tilt = (player.pos[1] - SCREEN_HEIGHT//2) * 0.1
+
+        # --- Layer 1: Background ---
         for layer in layers: layer.draw(screen, camera_x, tilt_offset=tilt, shake_offset=shake_offset)
         if pygame.time.get_ticks() % 500 < 250:
             pygame.draw.line(screen, RED, (0, 0), (0, SCREEN_HEIGHT), 3); draw_text(screen, "RIFT COLLAPSE", 14, 15, SCREEN_HEIGHT // 2, RED)
+
+        # --- Layer 2: Game world entities ---
         if not game_over: player.draw(screen, camera_x, shake_offset)
         if current_boss: current_boss.draw(screen, camera_x, shake_offset)
         if centipede_boss: centipede_boss.draw(screen, camera_x, shake_offset)
@@ -774,7 +1381,34 @@ def main():
         for sp in salvage_pods: sp.draw(screen, camera_x, shake_offset)
         for a in asteroids: a.draw(screen, camera_x, shake_offset)
         for part in particles: part.draw(screen, camera_x, shake_offset)
+        for ft in floating_texts: ft.draw(screen, camera_x, shake_offset)
+
+        # --- Layer 3: Phosphor trail (capture before CRT, apply as underlay) ---
+        phosphor.capture(screen)
+        phosphor.apply(screen)
+
+        # --- Layer 4: CRT post-processing (scanlines, bloom, vignette, chroma) ---
+        crt.apply(screen)
+
+        # --- Layer 5: HUD (rendered AFTER CRT so text stays crisp) ---
         draw_text(screen, f"SCORE: {score}", 24, 10, 10); draw_text(screen, f"LIVES: {lives}", 24, 10, 40); draw_text(screen, "SHIELD", 18, 10, 75, GREEN)
+        pygame.draw.rect(screen, WHITE, (85, 80, 104, 14), 1); pygame.draw.rect(screen, GREEN, (87, 82, int(player.shield_energy), 10))
+
+        bar_x = SCREEN_WIDTH // 2 - 200
+        for i, label in enumerate(POWERUP_LABELS):
+            rect = pygame.Rect(bar_x + i * 105, SCREEN_HEIGHT - 40, 100, 30); color = YELLOW if player.powerup_index == i else (50, 50, 50)
+            pygame.draw.rect(screen, color, rect, 2); draw_text(screen, label, 14, rect.centerx, rect.centery, color, center=True)
+        if player.current_weapon is not None: draw_text(screen, f"WEAPON: {WEAPON_LABELS[player.current_weapon]}", 18, 10, 125, CYAN)
+        if player.claiming: draw_text(screen, "CLAIMING TERRITORY", 18, 10, 100, YELLOW)
+
+        # Combo multiplier display
+        if combo.multiplier > 1:
+            pulse = abs(math.sin(pygame.time.get_ticks() * 0.005))
+            combo_size = int(28 + combo.display_timer * 1.5)
+            combo_color = (255, int(200 * pulse), int(50 * pulse))
+            draw_text(screen, f"x{combo.multiplier}", combo_size, SCREEN_WIDTH // 2, 20, combo_color, center=True)
+            # Chain counter
+            draw_text(screen, f"CHAIN: {combo.chain}", 14, SCREEN_WIDTH // 2, 45, YELLOW, center=True)
 
         if autopilot:
             diag_x = SCREEN_WIDTH - 220
@@ -794,27 +1428,45 @@ def main():
             pygame.draw.rect(screen, GREEN, (diag_x + 160, 200, int(autopilot_telemetry['opp'] * 40), 8))
             draw_text(screen, "AUTOPILOT ACTIVE", 18, SCREEN_WIDTH - 200, 10, RED)
 
+        # --- Dynamic BGM regeneration ---
         if pygame.time.get_ticks() % 6857 < 20:
             tension = autopilot_telemetry["risk"] if autopilot else 0.0
             bgm_sound.stop()
             bgm_sound = bgm_gen.generate_bgm(tension=tension)
             bgm_sound.play(loops=-1)
 
-        pygame.draw.rect(screen, WHITE, (85, 80, 104, 14), 1); pygame.draw.rect(screen, GREEN, (87, 82, int(player.shield_energy), 10)); bar_x = SCREEN_WIDTH // 2 - 200
-        for i, label in enumerate(POWERUP_LABELS):
-            rect = pygame.Rect(bar_x + i * 105, SCREEN_HEIGHT - 40, 100, 30); color = YELLOW if player.powerup_index == i else (50, 50, 50)
-            pygame.draw.rect(screen, color, rect, 2); draw_text(screen, label, 14, rect.centerx, rect.centery, color, center=True)
-        if player.current_weapon is not None: draw_text(screen, f"WEAPON: {WEAPON_LABELS[player.current_weapon]}", 18, 10, 125, CYAN)
-        if player.claiming: draw_text(screen, "CLAIMING TERRITORY", 18, 10, 100, YELLOW)
+        # --- Layer 6: Transmission / Game Over overlays ---
         if current_transmission:
             box_rect = pygame.Rect(100, 200, 600, 200); pygame.draw.rect(screen, BLACK, box_rect); pygame.draw.rect(screen, CYAN, box_rect, 2)
             draw_text(screen, "INCOMING TRANSMISSION...", 18, 120, 215, CYAN); draw_text(screen, current_transmission, 20, 120, 260, WHITE, wrap_width=560)
             draw_text(screen, "PRESS ANY KEY TO CONTINUE", 16, 400, 370, YELLOW, center=True)
+
+        # Border frame
         pygame.draw.rect(screen, NEON_BLUE, (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT), 4)
+
         if game_over:
             draw_text(screen, "GAME OVER", 64, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 50, YELLOW, True)
             draw_text(screen, f"FINAL SCORE: {score}", 32, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 20, WHITE, True)
             draw_text(screen, "PRESS 'R' TO RESTART", 24, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 70, WHITE, True)
+
+        # --- Layer 7: Pause overlay ---
+        if paused:
+            pause_overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            pause_overlay.fill((0, 0, 0, 120))
+            screen.blit(pause_overlay, (0, 0))
+            # Pulsing pause text
+            pulse = int(abs(math.sin(pygame.time.get_ticks() * 0.003)) * 255)
+            pause_color = (pulse, 255, pulse)
+            draw_text(screen, "PAUSED", 64, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 30, pause_color, True)
+            draw_text(screen, "P / ESC TO RESUME", 20, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 30, WHITE, True)
+            draw_text(screen, "F2: CRT EFFECTS   F3: FPS   F11: FULLSCREEN", 14, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 65, (120, 120, 140), True)
+
+        # --- Layer 8: FPS counter (always on top) ---
+        if show_fps:
+            fps_val = clock.get_fps()
+            fps_color = GREEN if fps_val >= 55 else YELLOW if fps_val >= 30 else RED
+            draw_text(screen, f"FPS: {fps_val:.0f}", 16, SCREEN_WIDTH - 90, 5, fps_color)
+
         pygame.display.flip(); clock.tick(FPS)
 
     pygame.quit()
