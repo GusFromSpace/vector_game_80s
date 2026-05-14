@@ -45,7 +45,9 @@ STAR_FRAGMENT_SPAWN_CHANCE = 0.015
 ENEMY_SPAWN_CHANCE = 0.006
 GLITCH_SEEKER_CHANCE = 0.003
 WEAPON_SPAWN_CHANCE = 0.0008
-WEAPON_LABELS = ["OMEGA", "REAR", "TRIPLE"]
+WEAPON_LABELS = ["PULSE", "REAR", "SPREAD", "WAVE", "LANCE", "SEEKER"]
+WEAPON_COLORS = {0: (0, 255, 255), 1: (80, 120, 255), 2: (0, 255, 100), 3: (255, 0, 255), 4: (255, 255, 0), 5: (255, 140, 0)}
+WEAPON_LETTERS = {0: "P", 1: "R", 2: "S", 3: "W", 4: "L", 5: "K"}
 BOSS_SCORE_MILESTONE = 20000
 BOSS_SCORE_CENTIPEDE = 40000
 SALVAGE_POD_LIFESPAN = 480 # 8 seconds
@@ -377,22 +379,42 @@ class BGMGenerator:
         }
 
 class SalvagePod:
-    def __init__(self, pos, weapon, option_count):
-        self.pos, self.weapon, self.option_count, self.lifespan, self.size, self.timer, self.being_siphoned = list(pos), weapon, option_count, SALVAGE_POD_LIFESPAN, 20, 0, False
+    def __init__(self, pos, weapon_stack, option_count):
+        if isinstance(weapon_stack, list):
+            self.weapon_stack = list(weapon_stack)
+        elif weapon_stack is not None:
+            self.weapon_stack = [weapon_stack]
+        else:
+            self.weapon_stack = []
+        self.pos, self.option_count, self.lifespan, self.size, self.timer, self.being_siphoned = list(pos), option_count, SALVAGE_POD_LIFESPAN, 20, 0, False
+    @property
+    def weapon(self):
+        return self.weapon_stack[0] if self.weapon_stack else None
     def update(self): self.timer += 1; self.lifespan -= 1; self.being_siphoned = False
     def draw(self, screen, camera_x, shake_offset):
         if self.lifespan > 120 or (self.timer % 10 < 5):
             cx, cy = self.pos[0] - camera_x + shake_offset[0], self.pos[1] + shake_offset[1]
             pygame.draw.circle(screen, NEON_BLUE, (int(cx), int(cy)), self.size, 2); draw_text(screen, "SALVAGE", 12, cx, cy - 25, NEON_BLUE, center=True)
-            color = [RED, NEON_BLUE, GREEN][self.weapon] if self.weapon is not None else WHITE
-            pygame.draw.rect(screen, color, (cx - 6, cy - 6, 12, 12), 1)
+            for i, wid in enumerate(self.weapon_stack):
+                color = WEAPON_COLORS.get(wid, WHITE)
+                pygame.draw.rect(screen, color, (cx - 8 + i * 10, cy - 6, 8, 12), 1)
+            if not self.weapon_stack:
+                pygame.draw.rect(screen, WHITE, (cx - 6, cy - 6, 12, 12), 1)
 
 class WeaponPickup:
-    def __init__(self, x_pos): self.pos, self.type, self.size, self.timer = [x_pos, random.randrange(100, SCREEN_HEIGHT - 100)], random.randint(0, 2), 15, 0
+    def __init__(self, x_pos): self.pos, self.type, self.size, self.timer = [x_pos, random.randrange(100, SCREEN_HEIGHT - 100)], random.randint(0, 5), 15, 0
+    # Allow forced weapon type for testing/curriculum
+    weapon_type = property(lambda self: self.type)
     def update(self): self.timer += 1
     def draw(self, screen, camera_x, shake_offset):
-        color = [RED, NEON_BLUE, GREEN][self.type]; cx, cy = self.pos[0] - camera_x + shake_offset[0], self.pos[1] + shake_offset[1]
-        if self.timer % 10 < 5: pygame.draw.rect(screen, color, (int(cx-8), int(cy-8), 16, 16), 2); draw_text(screen, "W", 12, cx, cy, color, center=True)
+        color = WEAPON_COLORS.get(self.type, CYAN); letter = WEAPON_LETTERS.get(self.type, "?")
+        cx, cy = self.pos[0] - camera_x + shake_offset[0], self.pos[1] + shake_offset[1]
+        if self.timer % 10 < 5:
+            pygame.draw.rect(screen, color, (int(cx-10), int(cy-10), 20, 20), 2)
+            draw_text(screen, letter, 14, cx, cy, color, center=True)
+        # Subtle glow pulse
+        pulse = abs(math.sin(self.timer * 0.08))
+        pygame.draw.circle(screen, tuple(int(c * pulse * 0.3) for c in color), (int(cx), int(cy)), 14, 1)
 
 class SFXQueue:
     def __init__(self, sfx_dict, ms_per_16th): self.sfx, self.ms_per_16th, self.queue, self.last_triggered_tick = sfx_dict, ms_per_16th, [], 0
@@ -418,12 +440,83 @@ class Particle:
         else: pygame.draw.circle(screen, self.color, (int(cx), int(cy)), self.size)
 
 class Projectile:
-    def __init__(self, pos, angle, is_enemy=False, speed=PROJECTILE_SPEED): self.pos, self.velocity, self.lifespan, self.is_enemy, self.grazed = list(pos), [math.cos(angle) * speed, math.sin(angle) * speed], PROJECTILE_LIFESPAN, is_enemy, False
-    def update(self): self.pos[0] += self.velocity[0]; self.pos[1] += self.velocity[1]; self.lifespan -= 1
+    def __init__(self, pos, angle, is_enemy=False, speed=PROJECTILE_SPEED, weapon_type=None):
+        self.pos, self.velocity, self.lifespan, self.is_enemy, self.grazed = list(pos), [math.cos(angle) * speed, math.sin(angle) * speed], PROJECTILE_LIFESPAN, is_enemy, False
+        self.weapon_type = weapon_type
+        self.piercing = (weapon_type == 4)  # LANCE passes through
+        self.age = 0
+        self.base_angle = angle
+        # SEEKER moves slower to compensate for homing
+        if weapon_type == 5 and not is_enemy:
+            self.velocity = [math.cos(angle) * speed * 0.6, math.sin(angle) * speed * 0.6]
+            self.lifespan = int(PROJECTILE_LIFESPAN * 1.5)
+        # LANCE gets extended range
+        if weapon_type == 4 and not is_enemy:
+            self.lifespan = int(PROJECTILE_LIFESPAN * 1.4)
+    def update(self, enemies=None):
+        self.age += 1
+        # WAVE: sinusoidal perpendicular offset
+        if self.weapon_type == 3 and not self.is_enemy:
+            perp_x = -self.velocity[1]; perp_y = self.velocity[0]
+            mag = math.sqrt(perp_x**2 + perp_y**2) or 1
+            wave = math.sin(self.age * 0.3) * 3
+            self.pos[0] += self.velocity[0] + (perp_x / mag) * wave
+            self.pos[1] += self.velocity[1] + (perp_y / mag) * wave
+        # SEEKER: gentle homing toward nearest enemy
+        elif self.weapon_type == 5 and not self.is_enemy and enemies:
+            nearest, min_d = None, float('inf')
+            for e in enemies:
+                d = get_distance_sq(self.pos, e.pos)
+                if d < min_d: nearest, min_d = e, d
+            if nearest and min_d < 400000:  # ~630px range
+                desired = math.atan2(nearest.pos[1] - self.pos[1], nearest.pos[0] - self.pos[0])
+                current = math.atan2(self.velocity[1], self.velocity[0])
+                diff = desired - current
+                while diff > math.pi: diff -= 2 * math.pi
+                while diff < -math.pi: diff += 2 * math.pi
+                turn = max(-0.05, min(0.05, diff))
+                speed = math.sqrt(self.velocity[0]**2 + self.velocity[1]**2)
+                new_angle = current + turn
+                self.velocity = [math.cos(new_angle) * speed, math.sin(new_angle) * speed]
+            self.pos[0] += self.velocity[0]; self.pos[1] += self.velocity[1]
+        else:
+            self.pos[0] += self.velocity[0]; self.pos[1] += self.velocity[1]
+        self.lifespan -= 1
     def draw(self, screen, camera_x, shake_offset=(0,0)):
-        cx, cy = self.pos[0] - camera_x + shake_offset[0], self.pos[1] + shake_offset[1]; color = RED if self.is_enemy else CYAN
-        pygame.draw.circle(screen, color, (int(cx), int(cy)), 2)
-        if random.random() > 0.5: pygame.draw.circle(screen, WHITE, (int(cx), int(cy)), 4, 1)
+        cx, cy = self.pos[0] - camera_x + shake_offset[0], self.pos[1] + shake_offset[1]
+        if self.is_enemy:
+            pygame.draw.circle(screen, RED, (int(cx), int(cy)), 2)
+            if random.random() > 0.5: pygame.draw.circle(screen, WHITE, (int(cx), int(cy)), 4, 1)
+            return
+        wt = self.weapon_type
+        if wt == 3:  # WAVE — flickering magenta dot
+            flicker = 2 + int(abs(math.sin(self.age * 0.4)) * 3)
+            pygame.draw.circle(screen, (255, 0, 255), (int(cx), int(cy)), flicker)
+            if self.age % 3 == 0: pygame.draw.circle(screen, (255, 100, 255), (int(cx), int(cy)), flicker + 2, 1)
+        elif wt == 4:  # LANCE — long thin line in velocity direction
+            angle = math.atan2(self.velocity[1], self.velocity[0])
+            ex, ey = cx + math.cos(angle) * 12, cy + math.sin(angle) * 12
+            pygame.draw.line(screen, YELLOW, (int(cx - math.cos(angle) * 4), int(cy - math.sin(angle) * 4)), (int(ex), int(ey)), 2)
+            pygame.draw.circle(screen, WHITE, (int(ex), int(ey)), 1)
+        elif wt == 5:  # SEEKER — rotating diamond
+            angle = self.age * 0.15
+            sz = 4
+            pts = [(cx + math.cos(angle + i * math.pi/2) * sz, cy + math.sin(angle + i * math.pi/2) * sz) for i in range(4)]
+            pygame.draw.polygon(screen, (255, 140, 0), pts, 0)
+            pygame.draw.polygon(screen, WHITE, pts, 1)
+        elif wt == 2:  # SPREAD — small triangle
+            angle = math.atan2(self.velocity[1], self.velocity[0])
+            pts = [(cx + math.cos(angle) * 5, cy + math.sin(angle) * 5),
+                   (cx + math.cos(angle + 2.5) * 3, cy + math.sin(angle + 2.5) * 3),
+                   (cx + math.cos(angle - 2.5) * 3, cy + math.sin(angle - 2.5) * 3)]
+            pygame.draw.polygon(screen, (0, 255, 100), pts, 0)
+        elif wt == 1:  # REAR — cyan with trail line
+            pygame.draw.circle(screen, (80, 120, 255), (int(cx), int(cy)), 3)
+            angle = math.atan2(self.velocity[1], self.velocity[0])
+            pygame.draw.line(screen, (40, 60, 180), (int(cx), int(cy)), (int(cx - math.cos(angle) * 8), int(cy - math.sin(angle) * 8)), 1)
+        else:  # PULSE (0) or default — standard cyan dot
+            pygame.draw.circle(screen, CYAN, (int(cx), int(cy)), 2)
+            if random.random() > 0.5: pygame.draw.circle(screen, WHITE, (int(cx), int(cy)), 4, 1)
 
 class Option:
     def __init__(self, player): self.player, self.history, self.pos, self.delay = player, [], list(player.pos), 15
@@ -585,17 +678,62 @@ class Player:
     def reset(self):
         self.pos, self.angle, self.velocity, self.visible = [100, SCREEN_HEIGHT // 2], 0, [BASE_SCROLL_SPEED, 0], True
         self.invulnerable_frames, self.shield_active, self.shield_energy = 90, False, SHIELD_MAX_ENERGY
-        self.trail, self.claiming, self.speed_boost, self.has_double, self.options, self.powerup_index, self.current_weapon = [], False, 0, False, [], -1, None
+        self.trail, self.claiming, self.speed_boost, self.has_double, self.options, self.powerup_index = [], False, 0, False, [], -1
+        self.weapon_stack = []  # list of weapon IDs, max 2 (fusion)
+    @property
+    def current_weapon(self):
+        """Backward compat: returns first weapon in stack or None."""
+        return self.weapon_stack[0] if self.weapon_stack else None
+    @current_weapon.setter
+    def current_weapon(self, value):
+        """Backward compat: setting replaces the entire stack."""
+        if value is None:
+            self.weapon_stack = []
+        else:
+            self.weapon_stack = [value]
+    def add_weapon(self, weapon_id):
+        """Add a weapon to the stack with fusion logic."""
+        if len(self.weapon_stack) == 0:
+            self.weapon_stack = [weapon_id]
+        elif len(self.weapon_stack) == 1:
+            self.weapon_stack.append(weapon_id)  # fuse!
+        else:
+            # FIFO: drop oldest, add new
+            self.weapon_stack = [self.weapon_stack[1], weapon_id]
     def rotate(self, direction):
         if not self.shield_active: self.angle += direction * (SHIP_ROTATION_SPEED + self.speed_boost * 0.02)
     def thrust(self):
         if not self.shield_active: accel = SHIP_THRUST_ACCELERATION + self.speed_boost * 0.05; self.velocity[0] += math.cos(self.angle) * accel; self.velocity[1] += math.sin(self.angle) * accel
+    def _emit_weapon_shots(self, weapon_id, tip_x, tip_y):
+        """Generate projectiles for a single weapon type."""
+        shots = []
+        fwd_pos = [self.pos[0] + tip_x, self.pos[1] + tip_y]
+        rear_pos = [self.pos[0] - tip_x, self.pos[1] - tip_y]
+        if weapon_id == 0:  # PULSE — single fast shot
+            shots.append(Projectile(list(fwd_pos), self.angle, weapon_type=0))
+        elif weapon_id == 1:  # REAR — front + back
+            shots.append(Projectile(list(fwd_pos), self.angle, weapon_type=1))
+            shots.append(Projectile(list(rear_pos), self.angle + math.pi, weapon_type=1))
+        elif weapon_id == 2:  # SPREAD — 3-way fan
+            for offset in [-0.2, 0, 0.2]:
+                shots.append(Projectile(list(fwd_pos), self.angle + offset, weapon_type=2))
+        elif weapon_id == 3:  # WAVE — sinusoidal path
+            shots.append(Projectile(list(fwd_pos), self.angle, weapon_type=3))
+        elif weapon_id == 4:  # LANCE — piercing line
+            shots.append(Projectile(list(fwd_pos), self.angle, weapon_type=4))
+        elif weapon_id == 5:  # SEEKER — homing
+            shots.append(Projectile(list(fwd_pos), self.angle, weapon_type=5))
+        return shots
     def fire(self):
         if not self.shield_active and not self.claiming:
-            shots, tip_x, tip_y = [], *rotate_point((self.size, 0), self.angle)
-            if self.current_weapon == 1: shots.extend([Projectile([self.pos[0] + tip_x, self.pos[1] + tip_y], self.angle), Projectile([self.pos[0] - tip_x, self.pos[1] - tip_y], self.angle + math.pi)])
-            elif self.current_weapon == 2: shots.extend([Projectile([self.pos[0] + tip_x, self.pos[1] + tip_y], self.angle), Projectile([self.pos[0] + tip_x, self.pos[1] + tip_y], self.angle - 0.2), Projectile([self.pos[0] + tip_x, self.pos[1] + tip_y], self.angle + 0.2)])
-            else: shots.append(Projectile([self.pos[0] + tip_x, self.pos[1] + tip_y], self.angle))
+            shots = []
+            tip_x, tip_y = rotate_point((self.size, 0), self.angle)
+            if self.weapon_stack:
+                for wid in self.weapon_stack:
+                    shots.extend(self._emit_weapon_shots(wid, tip_x, tip_y))
+            else:
+                # Default: single forward shot (no weapon equipped)
+                shots.append(Projectile([self.pos[0] + tip_x, self.pos[1] + tip_y], self.angle, weapon_type=0))
             if self.has_double: shots.append(Projectile([self.pos[0] + tip_x, self.pos[1] + tip_y], self.angle - 0.4))
             for opt in self.options:
                 shots.append(Projectile(list(opt.pos), self.angle))
@@ -770,7 +908,8 @@ def get_state(player, asteroids, enemies, projectiles, cam_x,
     dist_traveled = cam_x / 10000.0
     boss_flag = 1.0 if boss_active else 0.0
     claim_flag = 1.0 if player.claiming else 0.0
-    weapon_ch = (player.current_weapon + 1) / 4.0 if player.current_weapon is not None else 0.0
+    weapon_ch = (player.weapon_stack[0] + 1) / 7.0 if player.weapon_stack else 0.0
+    weapon_ch2 = (player.weapon_stack[1] + 1) / 7.0 if len(player.weapon_stack) > 1 else 0.0
     option_ch = len(player.options) / 2.0
     lives_ch = lives / 3.0
     scroll_ch = scroll_speed / 5.0
@@ -792,7 +931,7 @@ def get_state(player, asteroids, enemies, projectiles, cam_x,
 
     obs.extend([combo_mult, combo_decay, dist_traveled, boss_flag, claim_flag,
                 weapon_ch, option_ch, lives_ch, scroll_ch, shield_flag,
-                sf_dist, sf_angle, sp_dist, sp_angle])
+                sf_dist, sf_angle, sp_dist, sp_angle, weapon_ch2])
 
     return obs
 
@@ -800,8 +939,9 @@ def get_state(player, asteroids, enemies, projectiles, cam_x,
 # These module-level slots allow external signal processors to interface with
 # the simulation. Set them before calling main() to enable automated analysis.
 
-# External signal processor. Set to an object with .step(telemetry) -> list[float x5]
-# to enable automated navigation. Optional: .telemetry property -> dict.
+# External signal processor. Set to an object with .step(telemetry) -> list[float x5 or x6]
+# to enable automated navigation. Channel 5 (claim) is optional for backward compat.
+# Optional: .telemetry property -> dict.
 _AUTOPILOT_CONTROLLER = None
 
 # Session recorder. Set to a callable to capture simulation telemetry.
@@ -1119,13 +1259,15 @@ def main():
             keys = pygame.key.get_pressed()
 
             if autopilot and _AUTOPILOT_CONTROLLER is not None:
-                ai_act = _AUTOPILOT_CONTROLLER.step(state)
+                ai_act = list(_AUTOPILOT_CONTROLLER.step(state))
+                # Backward compat: 5-channel controllers get claim=0.0
+                if len(ai_act) < 6: ai_act.append(0.0)
                 if hasattr(_AUTOPILOT_CONTROLLER, 'telemetry'):
                     autopilot_telemetry.update(_AUTOPILOT_CONTROLLER.telemetry)
                 autopilot_telemetry["probs"] = [float(a) for a in ai_act]
             elif autopilot:
                 # Built-in demo pilot: simple rule-based fallback
-                ai_act = [1, 0, 0, random.random() > 0.92, player.shield_energy < 15]
+                ai_act = [1, 0, 0, random.random() > 0.92, player.shield_energy < 15, 0]
                 if player.pos[1] > SCREEN_HEIGHT * 0.7: ai_act[2] = 1
                 elif player.pos[1] < SCREEN_HEIGHT * 0.3: ai_act[1] = 1
                 autopilot_telemetry["probs"] = [float(a) for a in ai_act]
@@ -1147,7 +1289,8 @@ def main():
                     1.0 if keys[pygame.K_LEFT] else 0.0,
                     1.0 if keys[pygame.K_RIGHT] else 0.0,
                     1.0 if keys[pygame.K_SPACE] else 0.0,
-                    1.0 if keys[pygame.K_DOWN] else 0.0
+                    1.0 if keys[pygame.K_DOWN] else 0.0,
+                    1.0 if keys[pygame.K_LSHIFT] else 0.0
                 ]
 
             reward = 0.01
@@ -1179,7 +1322,7 @@ def main():
             for p_up in pickups[:]:
                 p_up.update()
                 if p_up.pos[0] < camera_x - 100: pickups.remove(p_up)
-                elif get_distance_sq(p_up.pos, player.pos) < (player.size + p_up.size)**2: player.current_weapon, _ = p_up.type, sfx_queue.add('weapon'); pickups.remove(p_up)
+                elif get_distance_sq(p_up.pos, player.pos) < (player.size + p_up.size)**2: player.add_weapon(p_up.type); sfx_queue.add('weapon'); pickups.remove(p_up)
                 else:
                     target_boss = (current_boss and get_distance_sq(p_up.pos, current_boss.pos) < 2500)
                     if target_boss: current_boss.current_weapon, _ = p_up.type, sfx_queue.add('weapon'); pickups.remove(p_up)
@@ -1190,7 +1333,7 @@ def main():
                 pod.update()
                 if pod.pos[0] < camera_x - 100 or pod.lifespan <= 0: salvage_pods.remove(pod)
                 elif get_distance_sq(pod.pos, player.pos) < (player.size + pod.size)**2:
-                    player.current_weapon = pod.weapon; [player.options.append(Option(player)) for _ in range(pod.option_count)]; sfx_queue.add('weapon'); salvage_pods.remove(pod)
+                    player.weapon_stack = list(pod.weapon_stack); [player.options.append(Option(player)) for _ in range(pod.option_count)]; sfx_queue.add('weapon'); salvage_pods.remove(pod)
             if centipede_boss:
                 centipede_boss.update(player)
                 if not player.shield_active and player.invulnerable_frames == 0:
@@ -1198,7 +1341,7 @@ def main():
                         sfx_queue.add('hit'); create_explosion(particles, player.pos, RED, 40); shake_amount, lives = 30, lives - 1
                         if lives <= 0 and not autopilot: game_over = True
                         else:
-                            if player.current_weapon is not None or player.options: salvage_pods.append(SalvagePod(player.pos, player.current_weapon, len(player.options)))
+                            if player.weapon_stack or player.options: salvage_pods.append(SalvagePod(player.pos, player.weapon_stack, len(player.options)))
                             player.reset(); player.pos[0] = camera_x + 100
                 for s in centipede_boss.segments[:]:
                     if not player.shield_active and player.invulnerable_frames == 0:
@@ -1206,9 +1349,11 @@ def main():
                              sfx_queue.add('hit'); create_explosion(particles, player.pos, RED, 40); shake_amount, lives = 30, lives - 1
                              if lives <= 0 and not autopilot: game_over = True
                              else:
-                                 if player.current_weapon is not None or player.options: salvage_pods.append(SalvagePod(player.pos, player.current_weapon, len(player.options)))
+                                 if player.weapon_stack or player.options: salvage_pods.append(SalvagePod(player.pos, player.weapon_stack, len(player.options)))
                                  player.reset(); player.pos[0] = camera_x + 100
-            if keys[pygame.K_LSHIFT] and not player.shield_active: player.claiming = True
+            # Claim logic — driven by action channel 5 in autopilot, LSHIFT in manual
+            claim_active = ai_act[5] > 0.5 if autopilot else keys[pygame.K_LSHIFT]
+            if claim_active and not player.shield_active: player.claiming = True
             else:
                 if player.claiming and len(player.trail) > 5:
                     if get_distance_sq(player.pos, player.trail[0]) < 2500:
@@ -1229,7 +1374,7 @@ def main():
                 sfx_queue.add('hit'); create_explosion(particles, player.pos, RED, 40); shake_amount, lives = 30, lives - 1
                 if lives <= 0 and not autopilot: game_over = True
                 else:
-                    if player.current_weapon is not None or player.options: salvage_pods.append(SalvagePod(player.pos, player.current_weapon, len(player.options)))
+                    if player.weapon_stack or player.options: salvage_pods.append(SalvagePod(player.pos, player.weapon_stack, len(player.options)))
                     player.reset(); player.pos[0] = camera_x + 100
             if not autopilot:
                 for m, text in STORY_MILESTONES.items():
@@ -1251,11 +1396,11 @@ def main():
                         sfx_queue.add('hit'); create_explosion(particles, player.pos, RED, 40); shake_amount, lives = 25, lives - 1
                         if lives <= 0 and not autopilot: game_over = True
                         else:
-                            if player.current_weapon is not None or player.options: salvage_pods.append(SalvagePod(player.pos, player.current_weapon, len(player.options)))
+                            if player.weapon_stack or player.options: salvage_pods.append(SalvagePod(player.pos, player.weapon_stack, len(player.options)))
                             player.reset(); player.pos[0] = camera_x + 100; glitch_seekers.remove(g)
             p_size_sq = player.size**2
             for p in projectiles[:]:
-                p.update()
+                p.update(enemies=enemies + glitch_seekers)
                 if p.lifespan <= 0 or p.pos[0] < camera_x or p.pos[0] > camera_x + SCREEN_WIDTH:
                     if p in projectiles: projectiles.remove(p)
                 else:
@@ -1266,13 +1411,15 @@ def main():
                             sfx_queue.add('hit'); create_explosion(particles, player.pos, RED, 40); shake_amount, lives = 30, lives - 1
                             if lives <= 0 and not autopilot: game_over = True
                             else:
-                                if player.current_weapon is not None or player.options: salvage_pods.append(SalvagePod(player.pos, player.current_weapon, len(player.options)))
+                                if player.weapon_stack or player.options: salvage_pods.append(SalvagePod(player.pos, player.weapon_stack, len(player.options)))
                                 player.reset(); player.pos[0] = camera_x + 100
                             if p in projectiles: projectiles.remove(p); continue
                     for g in glitch_seekers[:]:
                         if not p.is_enemy and get_distance_sq(p.pos, g.pos) < g.size**2:
                             def kg(t=g): nonlocal score; combo.register_kill(); pts = combo.apply(1500); score += pts; floating_texts.append(FloatingText(t.pos, f"+{pts}", GREEN)); create_explosion(particles, t.pos, GREEN, 20); [glitch_seekers.remove(t) if t in glitch_seekers else None]
-                            sfx_queue.add('exp', kg); projectiles.remove(p); break
+                            sfx_queue.add('exp', kg)
+                            if not p.piercing: projectiles.remove(p)
+                            break
                     if p not in projectiles: continue
                     if centipede_boss and not p.is_enemy:
                         if get_distance_sq(p.pos, centipede_boss.pos) < 900: sfx_queue.add('hit'); create_explosion(particles, centipede_boss.pos, RED, 10); projectiles.remove(p); break
@@ -1324,7 +1471,7 @@ def main():
                             sfx_queue.add('hit'); create_explosion(particles, player.pos, RED, 40); shake_amount, lives = 25, lives - 1
                             if lives <= 0 and not autopilot: game_over = True
                             else:
-                                if player.current_weapon is not None or player.options: salvage_pods.append(SalvagePod(player.pos, player.current_weapon, len(player.options)))
+                                if player.weapon_stack or player.options: salvage_pods.append(SalvagePod(player.pos, player.weapon_stack, len(player.options)))
                                 player.reset(); player.pos[0] = camera_x + 100; enemies.remove(e)
             for a in asteroids[:]:
                 a.update()
@@ -1349,7 +1496,7 @@ def main():
                     sfx_queue.add('hit'); create_explosion(particles, player.pos, RED, 30); lives -= 1
                     if lives <= 0 and not autopilot: game_over = True
                     else:
-                        if player.current_weapon is not None or player.options: salvage_pods.append(SalvagePod(player.pos, player.current_weapon, len(player.options)))
+                        if player.weapon_stack or player.options: salvage_pods.append(SalvagePod(player.pos, player.weapon_stack, len(player.options)))
                         player.reset(); player.pos[0] = camera_x + 100
                 for p in projectiles[:]:
                     if get_distance_sq(p.pos, a.pos) < a.size**2:
@@ -1358,7 +1505,9 @@ def main():
                             if t.size > 15 and len(asteroids) < MAX_ASTEROIDS: asteroids.append(Asteroid(t.pos[0], t.size // 2))
                             if t in asteroids: asteroids.remove(t)
                             if len(asteroids) < MAX_ASTEROIDS: asteroids.append(Asteroid(camera_x + SCREEN_WIDTH + random.randint(400, 800)))
-                        sfx_queue.add('exp', ka); shake_amount = 10; projectiles.remove(p); break
+                        sfx_queue.add('exp', ka); shake_amount = 10
+                        if not p.piercing: projectiles.remove(p)
+                        break
 
         # === RENDERING PIPELINE ===
         shake_offset = (random.randint(-int(shake_amount), int(shake_amount)), random.randint(-int(shake_amount), int(shake_amount))) if shake_amount > 0 else (0,0)
@@ -1398,7 +1547,14 @@ def main():
         for i, label in enumerate(POWERUP_LABELS):
             rect = pygame.Rect(bar_x + i * 105, SCREEN_HEIGHT - 40, 100, 30); color = YELLOW if player.powerup_index == i else (50, 50, 50)
             pygame.draw.rect(screen, color, rect, 2); draw_text(screen, label, 14, rect.centerx, rect.centery, color, center=True)
-        if player.current_weapon is not None: draw_text(screen, f"WEAPON: {WEAPON_LABELS[player.current_weapon]}", 18, 10, 125, CYAN)
+        if player.weapon_stack:
+            if len(player.weapon_stack) == 2:
+                loadout = f"LOADOUT: {WEAPON_LABELS[player.weapon_stack[0]]} + {WEAPON_LABELS[player.weapon_stack[1]]}"
+                c1, c2 = WEAPON_COLORS[player.weapon_stack[0]], WEAPON_COLORS[player.weapon_stack[1]]
+                fused_color = (min(255, (c1[0]+c2[0])//2+50), min(255, (c1[1]+c2[1])//2+50), min(255, (c1[2]+c2[2])//2+50))
+                draw_text(screen, loadout, 18, 10, 125, fused_color)
+            else:
+                draw_text(screen, f"LOADOUT: {WEAPON_LABELS[player.weapon_stack[0]]}", 18, 10, 125, WEAPON_COLORS.get(player.weapon_stack[0], CYAN))
         if player.claiming: draw_text(screen, "CLAIMING TERRITORY", 18, 10, 100, YELLOW)
 
         # Combo multiplier display
@@ -1430,7 +1586,14 @@ def main():
 
         # --- Dynamic BGM regeneration ---
         if pygame.time.get_ticks() % 6857 < 20:
-            tension = autopilot_telemetry["risk"] if autopilot else 0.0
+            # Compute tension from game state (works for all players, not just autopilot)
+            entity_pressure = min(1.0, (len(enemies) + len(glitch_seekers)) / 8.0)
+            scroll_pressure = min(1.0, (current_scroll_speed - BASE_SCROLL_SPEED) / 3.0)
+            boss_pressure = 0.5 if current_boss else (0.7 if centipede_boss else 0.0)
+            combo_energy = min(1.0, combo.chain / 6.0)
+            tension = max(entity_pressure, scroll_pressure, boss_pressure, combo_energy)
+            if autopilot:
+                tension = max(tension, autopilot_telemetry.get("risk", 0.0))
             bgm_sound.stop()
             bgm_sound = bgm_gen.generate_bgm(tension=tension)
             bgm_sound.play(loops=-1)
