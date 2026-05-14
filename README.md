@@ -1,7 +1,10 @@
 # VECTOR ASTEROIDS: THE NULL-VOID INCIDENT (1981)
 
 ## ATTRIBUTION
-This simulation was designed, implemented, and refined entirely by **Gemini CLI**, an interactive AI agent. The features and mechanics (ranging from 1979 to 1981) were generated based on direct user requests to evolve a simple vector script into a multi-layered arcade experience.
+
+The legacy version of this game was designed and implemented by **Gemini CLI**, an interactive AI agent, based on direct requests from [GusFromSpace](https://github.com/GusFromSpace).
+
+The current version has been extended and evolved by **GusFromSpace** with contributions from **Gemini CLI** and **Claude Code**.
 
 ## THE LORE: A SPECIFIC HISTORICAL ANOMALY
 The year is 1981. In a small, windowless office in Schenectady, New York, a regional logistics manager named Gary 'The Geb' Gebhart discovered that the corporate microwave was leaking a specific frequency (approx. 434.2 MHz) every time someone heated a 'Meat-Lovers' pocket sandwich. Gary noticed that his nearby oscilloscope didn't just show waves; it showed *geometry*. He began to suspect that the meat-pockets were opening a sub-harmonic rift into what he called the 'Null-Void.' This game is a reconstructed simulation of Gary's frantic attempts to navigate that rift using a modified pocket calculator and a stolen radar array before the breakroom was eventually decommissioned by the EPA in early 1982.
@@ -18,11 +21,31 @@ Navigate the Null-Void and destroy the Geometric Echoes (Asteroids).
 *   **LEFT SHIFT (HOLD)**: Territory Claim (1981 Qix Protocol)
     *   *Strategy: Loop back to your start point to vaporize everything inside the zone.*
     *   *Danger: If an echo touches your unfinished trail, Gary loses a life.*
+*   **C**: Activate queued power-up (Gradius Protocol)
 *   **P / ESC**: Pause simulation
 *   **F2**: Toggle CRT visual effects
 *   **F3**: Toggle FPS diagnostic overlay
 *   **F11**: Fullscreen mode
 *   **R**: Restart the simulation (Game Over state)
+
+### POWER-UP BAR (Gradius Protocol)
+Collect purple Star-Fragments to advance the selection cursor. Press **C** to activate:
+
+`SPEED UP → DOUBLE → OPTION → SHIELD`
+
+### WEAPON PICKUPS
+Collect **W** pickups to equip special weapons: `OMEGA`, `REAR`, `TRIPLE`.
+Warning: hostile signals can siphon your weapon if they get close.
+
+### COMBO SYSTEM
+Chain kills within a 2-second window to build a score multiplier (up to 16x).
+Multiplier resets on taking damage.
+
+### SCORE MILESTONES
+| Score | Event |
+|-------|-------|
+| 20,000 | First resonance event (boss) |
+| 40,000 | Deep rift cascade (second boss) |
 
 ### REQUIREMENTS
 *   Python 3.x
@@ -78,7 +101,7 @@ from null_void_sim import NullVoidSession
 session = NullVoidSession(
     calibration={'rift_density': 1.5, 'echo_aggression': 2.0},
     render=False,       # Set True to display the simulation
-    max_drift=18000     # Max ticks before session truncation
+    max_drift=18000     # Max ticks before session truncation (~5 min at 60fps)
 )
 
 # Initialize session with void coordinates
@@ -95,6 +118,23 @@ print(f"Final score: {data['score']}")
 session.close()
 ```
 
+### Session Data Fields
+```python
+{
+    'score': int,             # Current score
+    'lives': int,             # Remaining lives
+    'distance': float,        # Distance drifted through the rift
+    'ticks': int,             # Elapsed simulation ticks
+    'combo_chain': int,       # Current kill chain count
+    'combo_multiplier': int,  # Active score multiplier (1-16)
+    'boss_phase': str,        # 'drift' | 'resonance' | 'centipede'
+    'entity_count': int,      # Total active entities
+    'scroll_velocity': float, # Current rift drift speed
+    'player_pos': list,       # [x, y] world coordinates
+    'shield_energy': float,   # Remaining shield charge (0-100)
+}
+```
+
 ### Telemetry Format
 
 The telemetry readout contains 75 normalized float channels:
@@ -109,3 +149,8 @@ The telemetry readout contains 75 normalized float channels:
 | 61-74 | Extended harmonic analysis (combo, distance, boss phase, loadout, opportunities) |
 
 *Note: Channels 0-60 maintain backward compatibility with the original 61-channel oscilloscope format.*
+
+---
+
+## LICENSE
+GNU General Public License v3.0 — free to use, modify, and distribute. Any derivative works must remain open source under the same license.
